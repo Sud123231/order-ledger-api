@@ -214,12 +214,31 @@ def aggregate(question):
             )
 
     if any(word in q for word in ["how many", "number of", "count"]):
-        if "customer" in q and "order" not in q:
-            return len({o.get("customer") for o in orders})
+        if "distinct customer" in q or "unique customer" in q:
+            return len({
+              order.get("customer")
+              for order in orders
+              if order.get("customer")
+              and str(order.get("status", "")).lower() == "paid"
+            })
+
+        if "customer" in q:
+            return len({
+            order.get("customer")
+            for order in orders
+            if order.get("customer")
+        })
+
         if "product" in q and "order" not in q:
-            return len({o.get("product") for o in orders})
+            return len({
+            order.get("product")
+            for order in orders
+            if order.get("product")
+        })
+
         if "paid" in q or "revenue" in q:
-            return len(paid_orders)
+           return len(paid_orders)
+
         return len(orders)
 
     if any(word in q for word in ["top", "highest", "most", "best-selling", "bestselling"]):
