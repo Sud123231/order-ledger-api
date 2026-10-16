@@ -248,7 +248,24 @@ def aggregate(question):
     
                 return max(totals, key=totals.get)
     
-    if any(word in q for word in ["revenue", "sales", "turnover", "earned"]):
+    if any(
+    word in q
+    for word in [
+        "revenue",
+        "sales",
+        "turnover",
+        "earned",
+        "earn",
+        "how much did",
+        "how much has",
+        "how much was",
+        "how much in",
+        "income",
+        "brought in",
+        "generate",
+        "generated",
+    ]
+):
         return money(sum(amount_usd(o) for o in paid_orders))
 
     if "quantity" in q or "units sold" in q:
