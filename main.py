@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "latest-orders.json"
 IST = ZoneInfo("Asia/Kolkata")
@@ -44,13 +45,20 @@ def order_date(order):
 
 def amount_usd(order):
     currency = str(order.get("currency", "USD")).upper()
+
     if currency not in USD_PER_UNIT:
         raise ValueError(f"Unknown currency: {currency}")
+
     return Decimal(str(order.get("amount", 0))) * USD_PER_UNIT[currency]
 
 
 def money(value):
-    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    return float(
+        Decimal(value).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
 
 
 def find_period(question):
@@ -61,40 +69,61 @@ def find_period(question):
         r"(?:to|through|until|and)\s+(\d{4}-\d{2}-\d{2})\b",
         q,
     )
+
     if date_range:
+        start = date.fromisoformat(date_range.group(1))
+        end = date.fromisoformat(date_range.group(2))
+        return start, end
+
+    quarter_match = re.search(r"\bq([1-4])\s+(20\d{2})\b", q)
+
+    if quarter_match:
+        quarter = int(quarter_match.group(1))
+        year = int(quarter_match.group(2))
+        start_month = 3 * (quarter - 1) + 1
+        end_month = start_month + 2
+
         return (
-            date.fromisoformat(date_range.group(1)),
-            date.fromisoformat(date_range.group(2)),
+            date(year, start_month, 1),
+            date(
+                year,
+                end_month,
+                calendar.monthrange(year, end_month)[1],
+            ),
         )
 
-    quarter = re.search(r"\bq([1-4])\s+(20\d{2})\b", q)
-    if quarter:
-        qtr, year = int(quarter.group(1)), int(quarter.group(2))
-        month = 3 * (qtr - 1) + 1
-        end_month = month + 2
-        return (
-            date(year, month, 1),
-            date(year, end_month, calendar.monthrange(year, end_month)[1]),
+    month_lookup = {
+        name.lower(): month
+        for month in range(1, 13)
+        for name in (
+            calendar.month_name[month],
+            calendar.month_abbr[month],
         )
-
-    months = {
-        name.lower(): number
-        for number in range(1, 13)
-        for name in (calendar.month_name[number], calendar.month_abbr[number])
     }
+
     month_pattern = (
-        r"\b(" + "|".join(sorted(months, key=len, reverse=True))
+        r"\b("
+        + "|".join(sorted(month_lookup, key=len, reverse=True))
         + r")\s+(20\d{2})\b"
     )
+
     match = re.search(month_pattern, q)
+
     if match:
-        year, month = int(match.group(2)), months[match.group(1)]
+        month = month_lookup[match.group(1)]
+        year = int(match.group(2))
+
         return (
             date(year, month, 1),
-            date(year, month, calendar.monthrange(year, month)[1]),
+            date(
+                year,
+                month,
+                calendar.monthrange(year, month)[1],
+            ),
         )
 
     year_match = re.search(r"\b(20\d{2})\b", q)
+
     if year_match:
         year = int(year_match.group(1))
         return date(year, 1, 1), date(year, 12, 31)
@@ -102,131 +131,260 @@ def find_period(question):
     return None, None
 
 
+def match_entity(question, values):
+    q = normalize(question)
+
+    for value in sorted(
+        {str(value) for value in values if value is not None},
+        key=len,
+        reverse=True,
+    ):
+        pattern = r"(?<!\w)" + re.escape(value.lower()) + r"(?!\w)"
+
+        if re.search(pattern, q):
+            return value
+
+    return None
+
+
 def filter_orders(question):
     q = normalize(question)
     selected = list(ORDERS)
 
     start, end = find_period(q)
+
     if start is not None:
         selected = [
-            o for o in selected
-            if start <= order_date(o) <= end
+            order
+            for order in selected
+            if start <= order_date(order) <= end
         ]
 
-    regions = sorted(
-        {str(o["region"]) for o in ORDERS if o.get("region")},
-        key=len,
-        reverse=True,
+    region = match_entity(
+        q,
+        [order.get("region") for order in ORDERS],
     )
-    for region in regions:
-        if re.search(r"\b" + re.escape(region.lower()) + r"\b", q):
-            selected = [
-                o for o in selected
-                if str(o.get("region", "")).lower() == region.lower()
-            ]
-            break
 
-    products = sorted(
-        {str(o["product"]) for o in ORDERS if o.get("product")},
-        key=len,
-        reverse=True,
-    )
-    for product in products:
-        if re.search(r"\b" + re.escape(product.lower()) + r"\b", q):
-            selected = [
-                o for o in selected
-                if str(o.get("product", "")).lower() == product.lower()
-            ]
-            break
+    if region is not None:
+        selected = [
+            order
+            for order in selected
+            if str(order.get("region", "")).lower()
+            == region.lower()
+        ]
 
-    customers = sorted(
-        {str(o["customer"]) for o in ORDERS if o.get("customer")},
-        key=len,
-        reverse=True,
+    product = match_entity(
+        q,
+        [order.get("product") for order in ORDERS],
     )
-    for customer in customers:
-        if re.search(r"\b" + re.escape(customer.lower()) + r"\b", q):
-            selected = [
-                o for o in selected
-                if str(o.get("customer", "")).lower() == customer.lower()
-            ]
-            break
+
+    if product is not None:
+        selected = [
+            order
+            for order in selected
+            if str(order.get("product", "")).lower()
+            == product.lower()
+        ]
+
+    customer = match_entity(
+        q,
+        [order.get("customer") for order in ORDERS],
+    )
+
+    if customer is not None:
+        selected = [
+            order
+            for order in selected
+            if str(order.get("customer", "")).lower()
+            == customer.lower()
+        ]
 
     status_match = re.search(
-        r"\b(paid|refunded|pending|cancelled|canceled)\b", q
+        r"\b(paid|refunded|pending|cancelled|canceled)\b",
+        q,
     )
+
     if status_match:
         status = status_match.group(1)
+
         if status == "canceled":
             status = "cancelled"
+
         selected = [
-            o for o in selected
-            if str(o.get("status", "")).lower() == status
+            order
+            for order in selected
+            if str(order.get("status", "")).lower() == status
         ]
 
     return selected
 
 
 def is_count_question(q):
-    return any(
-        phrase in q
-        for phrase in (
-            "how many", "number of", "count", "distinct", "unique",
-            "number",
+    return bool(
+        re.search(
+            r"\b(how many|count|number of|number|"
+            r"distinct|unique|different)\b",
+            q,
         )
     )
 
 
 def is_revenue_question(q):
-    return any(
-        phrase in q
-        for phrase in (
-            "revenue", "sales", "turnover", "earned", "earn",
-            "income", "brought in", "generated", "generate",
-            "how much", "total amount",
+    return bool(
+        re.search(
+            r"\b(revenue|sales|turnover|earned|earn|"
+            r"income|profit|brought in|generated|generate|"
+            r"how much|total amount)\b",
+            q,
         )
     )
+
+
+def is_ranking_question(q):
+    return bool(
+        re.search(
+            r"\b(highest|lowest|top|most|least|"
+            r"best-selling|bestselling|largest|smallest)\b",
+            q,
+        )
+    )
+
+
+def is_distinct_customer_question(q):
+    return (
+        "customer" in q
+        and is_count_question(q)
+    )
+
+
+def customer_count(orders):
+    return len({
+        str(order["customer"]).strip()
+        for order in orders
+        if order.get("customer") is not None
+        and str(order["customer"]).strip()
+    })
+
+
+def total_revenue(orders):
+    paid_orders = [
+        order for order in orders
+        if str(order.get("status", "")).lower() == "paid"
+    ]
+
+    return money(
+        sum(
+            (amount_usd(order) for order in paid_orders),
+            Decimal("0"),
+        )
+    )
+
+
+def total_refunds(orders):
+    refunded_orders = [
+        order for order in orders
+        if str(order.get("status", "")).lower() == "refunded"
+    ]
+
+    return money(
+        sum(
+            (amount_usd(order) for order in refunded_orders),
+            Decimal("0"),
+        )
+    )
+
+
+def count_units(orders):
+    return sum(
+        int(order.get("qty", 0))
+        for order in orders
+        if str(order.get("status", "")).lower() == "paid"
+    )
+
+
+def ranking_result(question, orders):
+    q = normalize(question)
+
+    if "customer" in q:
+        group_field = "customer"
+    elif "region" in q:
+        group_field = "region"
+    elif "product" in q:
+        group_field = "product"
+    else:
+        return None
+
+    paid_orders = [
+        order for order in orders
+        if str(order.get("status", "")).lower() == "paid"
+    ]
+
+    quantity_mode = bool(
+        re.search(r"\b(quantity|units|volume)\b", q)
+    )
+
+    totals = defaultdict(Decimal)
+
+    for order in paid_orders:
+        group_value = order.get(group_field)
+
+        if group_value is None:
+            continue
+
+        if quantity_mode:
+            totals[str(group_value)] += Decimal(
+                str(order.get("qty", 0))
+            )
+        else:
+            totals[str(group_value)] += amount_usd(order)
+
+    if not totals:
+        return "No matching results"
+
+    if re.search(r"\b(lowest|least|smallest)\b", q):
+        return min(totals, key=totals.get)
+
+    return max(totals, key=totals.get)
 
 
 def aggregate(question):
     q = normalize(question)
     orders = filter_orders(q)
 
-    paid_orders = [
-        o for o in orders
-        if str(o.get("status", "")).lower() == "paid"
-    ]
-    refunded_orders = [
-        o for o in orders
-        if str(o.get("status", "")).lower() == "refunded"
-    ]
+    # Customer counts must be handled before generic counts.
+    if is_distinct_customer_question(q):
+        return customer_count(orders)
 
-    # Refund questions take precedence over general amount questions.
+    # Refund questions use refunded orders, not paid revenue.
     if "refund" in q:
         if is_count_question(q):
-            return len(refunded_orders)
-        return money(sum((amount_usd(o) for o in refunded_orders), Decimal(0)))
+            return sum(
+                1 for order in orders
+                if str(order.get("status", "")).lower() == "refunded"
+            )
 
-    # Distinct customer counts must always deduplicate customer IDs.
-    if "customer" in q and is_count_question(q):
-        customer_orders = orders
-        if "paid" in q or "bought" in q or "purchased" in q:
-            customer_orders = paid_orders
+        return total_refunds(orders)
 
-        return len({
-            str(o["customer"])
-            for o in customer_orders
-            if o.get("customer")
-        })
+    # Rankings must be handled before general revenue questions.
+    if is_ranking_question(q):
+        result = ranking_result(q, orders)
 
-    # Counts of orders, products, or other records.
+        if result is not None:
+            return result
+
+    # Other counts.
     if is_count_question(q):
         if "paid" in q:
-            return len(paid_orders)
+            return sum(
+                1 for order in orders
+                if str(order.get("status", "")).lower() == "paid"
+            )
 
         if "product" in q and "order" not in q:
             return len({
-                o.get("product") for o in orders if o.get("product")
+                order.get("product")
+                for order in orders
+                if order.get("product")
             })
 
         if "order" in q:
@@ -234,56 +392,30 @@ def aggregate(question):
 
         return len(orders)
 
-    # Ranking questions must run before the general revenue calculation.
-    if any(
-        word in q
-        for word in ("highest", "lowest", "top", "most", "best-selling",
-                     "bestselling", "least")
-    ):
-        group_field = None
-        if "customer" in q:
-            group_field = "customer"
-        elif "region" in q:
-            group_field = "region"
-        elif "product" in q:
-            group_field = "product"
-
-        if group_field:
-            totals = defaultdict(Decimal)
-            quantity_mode = "quantity" in q or "units" in q
-
-            for o in paid_orders:
-                key = o.get(group_field)
-                if key is None:
-                    continue
-
-                if quantity_mode:
-                    totals[key] += Decimal(str(o.get("qty", 0)))
-                else:
-                    totals[key] += amount_usd(o)
-
-            if not totals:
-                return "No matching results"
-
-            if "lowest" in q or "least" in q:
-                return min(totals, key=totals.get)
-
-            return max(totals, key=totals.get)
-
-    # Revenue includes paid orders only.
+    # Revenue: only paid orders contribute.
     if is_revenue_question(q):
-        return money(sum((amount_usd(o) for o in paid_orders), Decimal(0)))
+        return total_revenue(orders)
 
-    if "quantity" in q or "units sold" in q:
-        return sum(int(o.get("qty", 0)) for o in paid_orders)
+    # Units sold.
+    if re.search(r"\b(quantity|units sold|number of units)\b", q):
+        return count_units(orders)
 
-    if any(word in q for word in ("average", "avg", "mean")):
+    # Average paid order value.
+    if re.search(r"\b(average|avg|mean)\b", q):
+        paid_orders = [
+            order for order in orders
+            if str(order.get("status", "")).lower() == "paid"
+        ]
+
         if not paid_orders:
             return 0
-        return money(
-            sum((amount_usd(o) for o in paid_orders), Decimal(0))
-            / len(paid_orders)
+
+        total = sum(
+            (amount_usd(order) for order in paid_orders),
+            Decimal("0"),
         )
+
+        return money(total / len(paid_orders))
 
     return {
         "error": "Question type not recognized",
@@ -292,16 +424,25 @@ def aggregate(question):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "orders_loaded": len(ORDERS)}
+    return {
+        "status": "running",
+        "orders_loaded": len(ORDERS),
+    }
 
 
 @app.post("/")
 def answer_question(request: QuestionRequest):
     question = request.question.strip()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty",
+        )
 
     try:
-        return {"answer": aggregate(question)}
+        answer = aggregate(question)
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"answer": answer}
